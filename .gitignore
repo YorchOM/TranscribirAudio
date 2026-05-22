@@ -1,0 +1,19 @@
+# Entorno virtual
+.venv
+.venv/
+.venv/*
+
+
+# Archivos de audio y transcripciones generadas
+*.mp3
+*.wav
+*.ogg
+*.flac
+*.opus
+*.m4a
+*.wma
+*.aac
+*_transcripcion.txt
+
+# Claude Code
+.claude/
