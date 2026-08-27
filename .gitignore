@@ -17,3 +17,19 @@
 
 # Claude Code
 .claude/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Assets pesados que no se trackean (se reponen con scripts o manualmente)
+assets/ffmpeg/*.exe
+assets/whisper_models/*.pt
+
+# Token de Hugging Face (NO subir)
+.hf_token
+
+# Cache de Python
+__pycache__/
+*.pyc

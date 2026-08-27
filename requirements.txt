@@ -2,3 +2,5 @@ openai-whisper
 pydub==0.25.1
 torch
 torchaudio
+# Diarización de hablantes (quién dice cada cosa)
+pyannote.audio
