@@ -180,8 +180,45 @@ def calcular_trozos(muestras, sample_rate, objetivo=TROZO_SEGUNDOS,
 # Procesos de trabajo (han de ser funciones de nivel de módulo: se serializan)
 # --------------------------------------------------------------------------
 
+def _enmudecer():
+    """
+    Deja al proceso hijo sin escribir en la consola.
+
+    En Windows, si alguien selecciona texto en la ventana de la consola (Quick
+    Edit), el sistema BLOQUEA a todo proceso que intente escribir en ella hasta
+    que se deselecciona. Con varios hijos compartiendo consola eso cuelga la
+    ejecución entera de forma indefinida y silenciosa: los procesos siguen
+    vivos y con la CPU a cero. Se perdieron 6 horas así (28-ago-2026).
+
+    Escribe sólo el proceso padre, y poco. El progreso de los hijos viaja por
+    una cola (ver _hook_progreso).
+    """
+    import warnings
+
+    warnings.simplefilter("ignore")
+    try:
+        nulo = open(os.devnull, "w", encoding="utf-8")
+        sys.stdout = nulo
+        sys.stderr = nulo
+    except OSError:
+        pass
+
+
+def _hook_progreso(cola, etiqueta):
+    """Hook de pyannote que manda el progreso al padre en vez de imprimirlo."""
+    def hook(nombre_paso, artefacto=None, file=None, total=None, completed=None):
+        if not total:
+            return
+        try:
+            cola.put_nowait((etiqueta, nombre_paso, completed or 0, total))
+        except Exception:
+            pass  # el progreso es informativo: si no cabe, se pierde y da igual
+    return hook
+
+
 def _worker_transcribir(tarea):
     """Transcribe un trozo del WAV y devuelve sus segmentos ya desplazados."""
+    _enmudecer()
     torch.set_num_threads(tarea["hilos"])
     inicio = tarea["inicio"]
 
@@ -224,16 +261,20 @@ def _worker_transcribir(tarea):
 
 def _worker_diarizar(tarea):
     """Ejecuta la diarización en su propio proceso, en paralelo con Whisper."""
+    _enmudecer()
     torch.set_num_threads(tarea["hilos"])
     try:
         from diarize import diarizar
 
+        cola = tarea.get("cola")
         t0 = time.monotonic()
         turnos = diarizar(
             tarea["ruta"],
             num_hablantes=tarea["num_hablantes"],
             min_hablantes=tarea["min_hablantes"],
             max_hablantes=tarea["max_hablantes"],
+            hook=_hook_progreso(cola, "hablantes") if cola is not None else None,
+            silencioso=True,
         )
         guardar_turnos(tarea["cache"], turnos, tarea["duracion_audio"])
         return {"turnos": turnos, "duracion": time.monotonic() - t0}
@@ -664,7 +705,23 @@ def _plan_de_trabajo(procesos_pedidos, con_diarizacion, n_trozos):
     return procesos, hilos, (HILOS_POR_TRABAJADOR if con_diarizacion else 0)
 
 
-def _transcribir_en_paralelo(ruta_wav, trozos, opciones, hilos, ejecutor):
+def _ultimo_progreso(cola):
+    """Vacía la cola de progreso y devuelve el aviso más reciente, si hay."""
+    if cola is None:
+        return None
+    ultimo = None
+    try:
+        while True:
+            ultimo = cola.get_nowait()
+    except Exception:
+        pass  # cola vacía (o proxy caído): nos quedamos con lo último que vino
+    if not ultimo:
+        return None
+    _, paso, completado, total = ultimo
+    return f"{paso} {100 * completado / total:.0f}%"
+
+
+def _transcribir_en_paralelo(ruta_wav, trozos, opciones, hilos, ejecutor, cola=None):
     """Lanza un proceso por trozo y va recogiendo resultados según terminan."""
     from concurrent.futures import as_completed
 
@@ -681,13 +738,35 @@ def _transcribir_en_paralelo(ruta_wav, trozos, opciones, hilos, ejecutor):
         transcurrido = time.monotonic() - t0
         hechos = len(resultados)
         restante = transcurrido / hechos * (len(trozos) - hechos)
+        avance = _ultimo_progreso(cola)
         print(f"  [{hechos}/{len(trozos)}] trozo {_formato_tiempo(inicio)}-{_formato_tiempo(fin)}"
               f" listo · lleva {_formato_duracion(transcurrido)}"
-              + (f", quedan ~{_formato_duracion(restante)}" if hechos < len(trozos) else ""),
+              + (f", quedan ~{_formato_duracion(restante)}" if hechos < len(trozos) else "")
+              + (f" · hablantes: {avance}" if avance else ""),
               flush=True)
 
     resultados.sort(key=lambda r: r["indice"])
     return resultados
+
+
+def _esperar_diarizacion(futuro, cola, desde):
+    """
+    Espera a la diarización informando cada minuto de que sigue viva.
+
+    Sin esto son 30-60 minutos de silencio absoluto, indistinguibles de una
+    colgada. Y colgadas ha habido: ver _enmudecer().
+    """
+    from concurrent.futures import wait
+
+    if not futuro.done():
+        print("Esperando a que termine la identificación de hablantes...", flush=True)
+    while True:
+        listos, _ = wait([futuro], timeout=60)
+        if listos:
+            return futuro.result()
+        avance = _ultimo_progreso(cola)
+        print(f"  ...hablantes en marcha, llevamos {_formato_duracion(time.monotonic() - desde)}"
+              + (f" · {avance}" if avance else ""), flush=True)
 
 
 def transcribir_archivo(
@@ -779,37 +858,44 @@ def transcribir_archivo(
             from concurrent.futures import ProcessPoolExecutor
 
             trabajadores = en_paralelo + (1 if hay_que_diarizar else 0)
-            with ProcessPoolExecutor(max_workers=trabajadores) as ejecutor:
-                futuro_diarizacion = None
-                if hay_que_diarizar:
-                    print("\nIdentificando hablantes en paralelo (pyannote)...")
-                    futuro_diarizacion = ejecutor.submit(_worker_diarizar, {
-                        "ruta": tmp_path,
-                        "num_hablantes": num_hablantes,
-                        "min_hablantes": min_hablantes,
-                        "max_hablantes": max_hablantes,
-                        "hilos": hilos_diarizacion,
-                        "cache": ruta_cache,
-                        "duracion_audio": duracion_total,
-                    })
+            gestor = multiprocessing.Manager() if hay_que_diarizar else None
+            cola = gestor.Queue(maxsize=200) if gestor else None
+            try:
+                with ProcessPoolExecutor(max_workers=trabajadores) as ejecutor:
+                    futuro_diarizacion, desde_diarizacion = None, time.monotonic()
+                    if hay_que_diarizar:
+                        print("\nIdentificando hablantes en paralelo (pyannote)...")
+                        futuro_diarizacion = ejecutor.submit(_worker_diarizar, {
+                            "ruta": tmp_path,
+                            "num_hablantes": num_hablantes,
+                            "min_hablantes": min_hablantes,
+                            "max_hablantes": max_hablantes,
+                            "hilos": hilos_diarizacion,
+                            "cache": ruta_cache,
+                            "duracion_audio": duracion_total,
+                            "cola": cola,
+                        })
 
-                print("\nIniciando transcripción con Whisper...")
-                for r in _transcribir_en_paralelo(tmp_path, trozos, opciones, hilos, ejecutor):
-                    segmentos.extend(r["segments"])
-                    if r["idioma"]:
-                        idiomas.append(r["idioma"])
+                    print("\nIniciando transcripción con Whisper...")
+                    for r in _transcribir_en_paralelo(tmp_path, trozos, opciones, hilos,
+                                                      ejecutor, cola):
+                        segmentos.extend(r["segments"])
+                        if r["idioma"]:
+                            idiomas.append(r["idioma"])
 
-                if futuro_diarizacion:
-                    if not futuro_diarizacion.done():
-                        print("Esperando a que termine la identificación de hablantes...")
-                    salida = futuro_diarizacion.result()
-                    if "error" in salida:
-                        aviso_diarizacion = salida["error"]
-                        print("\n[!] No se pudo identificar hablantes, se continúa sin ellos:")
-                        print(f"    {aviso_diarizacion}\n")
-                    else:
-                        turnos = salida["turnos"]
-                        print(f"Hablantes identificados en {_formato_duracion(salida['duracion'])}.")
+                    if futuro_diarizacion:
+                        salida = _esperar_diarizacion(futuro_diarizacion, cola, desde_diarizacion)
+                        if "error" in salida:
+                            aviso_diarizacion = salida["error"]
+                            print("\n[!] No se pudo identificar hablantes, se continúa sin ellos:")
+                            print(f"    {aviso_diarizacion}\n")
+                        else:
+                            turnos = salida["turnos"]
+                            print("Hablantes identificados en "
+                                  f"{_formato_duracion(salida['duracion'])}.")
+            finally:
+                if gestor:
+                    gestor.shutdown()
         else:
             # Un solo proceso: se transcribe del tirón, con el progreso de Whisper
             print("\nIniciando transcripción con Whisper...")

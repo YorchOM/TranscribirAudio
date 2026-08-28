@@ -188,11 +188,23 @@ def _extraer_turnos(resultado):
     return turnos
 
 
-def diarizar(ruta_wav, num_hablantes=None, min_hablantes=None, max_hablantes=None, token=None):
+def diarizar(ruta_wav, num_hablantes=None, min_hablantes=None, max_hablantes=None,
+             token=None, hook=None, silencioso=False):
     """
     Devuelve los turnos de palabra de un WAV: [(inicio_seg, fin_seg, etiqueta), ...].
 
     num_hablantes: si se conoce el número exacto de personas, mejora bastante.
+
+    hook: función de progreso de pyannote, con la firma
+        hook(nombre_paso, artefacto=None, file=None, total=None, completed=None).
+    silencioso: no imprime NI USA la barra de progreso de pyannote (rich).
+
+    Ojo con esto último: cuando la diarización corre en un proceso hijo que
+    comparte la consola de Windows con otros, la barra de progreso escribe sin
+    parar y basta con que alguien seleccione texto en esa ventana (Quick Edit)
+    para que el sistema BLOQUEE a todos los que escriben. Se han visto colgadas
+    de horas por eso. Desde un proceso hijo, llamar con silencioso=True y
+    reportar el progreso por otra vía (ver hook).
     """
     pipeline = cargar_pipeline(token=token)
     waveform, sample_rate = cargar_waveform(ruta_wav)
@@ -208,16 +220,24 @@ def diarizar(ruta_wav, num_hablantes=None, min_hablantes=None, max_hablantes=Non
 
     entrada = {"waveform": waveform, "sample_rate": sample_rate}
 
-    print("Detectando hablantes... (puede tardar varios minutos en CPU)")
-    try:
-        from pyannote.audio.pipelines.utils.hook import ProgressHook
+    if not silencioso:
+        print("Detectando hablantes... (puede tardar varios minutos en CPU)")
 
-        with ProgressHook() as hook:
-            resultado = pipeline(entrada, hook=hook, **kwargs)
-    except Exception:
+    if hook is not None:
+        resultado = pipeline(entrada, hook=hook, **kwargs)
+    elif silencioso:
         resultado = pipeline(entrada, **kwargs)
+    else:
+        try:
+            from pyannote.audio.pipelines.utils.hook import ProgressHook
+
+            with ProgressHook() as barra:
+                resultado = pipeline(entrada, hook=barra, **kwargs)
+        except Exception:
+            resultado = pipeline(entrada, **kwargs)
 
     turnos = _extraer_turnos(resultado)
     etiquetas = sorted({t[2] for t in turnos})
-    print(f"Hablantes detectados: {len(etiquetas)} ({', '.join(etiquetas)})")
+    if not silencioso:
+        print(f"Hablantes detectados: {len(etiquetas)} ({', '.join(etiquetas)})")
     return turnos

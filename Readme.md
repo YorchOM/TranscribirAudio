@@ -298,6 +298,25 @@ Para cambiar el modelo, usa `--modelo medium` o la variable `WHISPER_MODEL`.
   forma de onda, para evitar que torchcodec busque las DLL de ffmpeg (la build de winget es
   estática y no las trae)
 - **Limpieza automática**: Los archivos temporales se eliminan automáticamente
+- **Los procesos hijos no escriben en la consola** (`_enmudecer()`), y es a propósito: en
+  Windows, si alguien **selecciona texto con el ratón** en la ventana de la consola (el
+  *Quick Edit* que viene activado de fábrica), el sistema **bloquea a todo proceso que
+  intente escribir en ella** hasta que se deselecciona. Con varios procesos compartiendo
+  consola —y con la barra de progreso de pyannote escribiendo sin parar— eso cuelga la
+  ejecución entera de forma silenciosa: los procesos siguen vivos, con la CPU a cero. Aquí
+  costó una colgada de 6 horas. Ahora sólo escribe el proceso padre, el progreso de la
+  diarización viaja por una cola, y cada minuto se imprime un latido para que se vea que
+  sigue viva. **Si alguna vez ves la ejecución parada, comprueba primero si has hecho clic
+  dentro de la ventana**: se despega pulsando Esc.
+
+  Para saber si un proceso está trabajando de verdad o bloqueado, mira la CPU acumulada:
+
+  ```powershell
+  Get-Process python | Select-Object Id, StartTime, CPU
+  ```
+
+  Un proceso con 4 hilos debe acumular ~4 minutos de CPU por cada minuto de reloj. Si lleva
+  horas vivo con minutos de CPU, está bloqueado, no lento.
 
 ## 📁 Archivos del Proyecto
 
