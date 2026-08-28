@@ -36,12 +36,22 @@ sobre una grabación real de reunión con 3 personas:
 |---|---|---|
 | 10 min de audio, sin hablantes | ~8-10 min | **1 min 35 s** |
 | 10 min de audio, con hablantes | ~25 min | **5 min 34 s** |
-| 1 h de audio, sin hablantes | ~50 min | **~10 min** |
-| 1 h de audio, con hablantes | 2 h 37 *(medido)* | **~35 min** |
+| 1 h de audio, sin hablantes | ~50 min | **~7-10 min** |
+| 1 h de audio, con hablantes | 2 h 37 *(medido)* | **~1 h 15** *(medido)* |
 
 En el caso con hablantes el reloj lo marca **entero la diarización**: en la prueba de
 10 minutos, Whisper tardó 2 min 24 y pyannote 5 min 30, y como van en paralelo el total
 fue 5 min 34. Bajar de ahí exige renunciar a saber quién habla (`--rapido`).
+
+⚠️ Ojo con extrapolar de audios cortos: el coste de la diarización **no crece sólo con la
+duración**, sino con el número de intervenciones que hay que comparar entre sí. Sobre 10
+minutos son 5 min 30, pero una hora no son 33 min sino del orden de **1 h**: una hora de
+conversación a tres tiene muchas más intervenciones que seis veces las de diez minutos.
+
+Por eso los turnos de hablantes **se guardan** en `<audio>_hablantes.json` junto al audio y
+se reutilizan en las siguientes ejecuciones sobre ese mismo fichero: reprocesarlo (otro
+modelo, otro formato, otro post-proceso) pasa a costar sólo los minutos de Whisper.
+Con `--rehacer-hablantes` se ignora lo guardado y se recalcula.
 
 De dónde sale la mejora:
 
@@ -67,10 +77,29 @@ Va **activada por defecto**. Cada línea sale así:
 ```
 [Idioma principal detectado: es]
 [Hablantes identificados: 3 - Hablante 1, Hablante 2, Hablante 3]
+[Reparto del tiempo: Hablante 2 48% · Hablante 1 35% · Hablante 3 17%]
+[Atribuciones dudosas: 128 de 1263 lineas (10%), marcadas con (?). No te fies del hablante en esas lineas]
 
 [00:00:00 -> 00:00:04] Hablante 1: Buenos días, ¿empezamos?
 [00:00:04 -> 00:00:09] Hablante 2: Sí, yo traigo el punto de presupuesto.
+[00:00:09 -> 00:00:11] Hablante 3 (?): Yo lo veo bien.
 ```
+
+### Cuánto fiarse: el `(?)` y el reparto del tiempo
+
+La diarización no es fiable al 100 % y el peligro no son los errores, sino que **van
+disfrazados de aciertos**: si todas las líneas se ven igual de seguras, una atribución
+equivocada contamina el análisis posterior más de lo que ayudan las correctas.
+
+Por eso cada línea se contrasta con los turnos de pyannote y se marca con `(?)` cuando el
+respaldo es flojo: el tramo se reparte entre dos hablantes, hay voces solapadas, o no cae
+dentro de ningún turno y se ha asignado por cercanía. Con eso ya puedes leer el .txt
+sabiendo de qué fiarte. El umbral se ajusta con `TRANSCRIBIR_UMBRAL_DUDA` (0.6 por defecto;
+1.0 = sólo lo perfecto, 0.0 = casi nada marcado).
+
+El **reparto del tiempo** de la cabecera es la comprobación de cordura rápida: si conoces la
+conversación y ves que a alguien le asigna un 60 % cuando apenas habló, la diarización se ha
+equivocado de largo y no merece la pena usarla en ese audio.
 
 ### Configuración inicial (una sola vez)
 
@@ -187,6 +216,7 @@ Opciones disponibles:
 | `--procesos N` | Trozos transcritos a la vez. Por defecto, automático según los núcleos |
 | `--idioma es` | Fuerza el idioma en vez de detectarlo en cada trozo |
 | `--sin-agrupar` | Una línea por frase, sin unir las seguidas del mismo hablante |
+| `--rehacer-hablantes` | Ignora los turnos guardados de una ejecución anterior y los recalcula |
 
 También por variables de entorno: `TRANSCRIBIR_DIARIZAR=0` desactiva los hablantes de forma
 permanente, `WHISPER_MODEL` cambia el modelo por defecto y `PYANNOTE_MODEL` el de diarización.
@@ -276,3 +306,4 @@ Para cambiar el modelo, usa `--modelo medium` o la variable `WHISPER_MODEL`.
 - `diarize.py` - Identificación de hablantes con pyannote.audio
 - `requirements.txt` - Dependencias del proyecto
 - `.hf_token` - Token de Hugging Face (lo creas tú; no se sube al repo)
+- `<audio>_hablantes.json` - Turnos de pyannote cacheados junto a cada audio (no se sube)

@@ -235,9 +235,59 @@ def _worker_diarizar(tarea):
             min_hablantes=tarea["min_hablantes"],
             max_hablantes=tarea["max_hablantes"],
         )
+        guardar_turnos(tarea["cache"], turnos, tarea["duracion_audio"])
         return {"turnos": turnos, "duracion": time.monotonic() - t0}
     except Exception as e:  # se devuelve, no se lanza: la transcripción sigue
         return {"error": str(e)}
+
+
+# --------------------------------------------------------------------------
+# Caché de turnos
+#
+# La diarización es, con diferencia, lo más caro (una hora de audio ronda la
+# hora de CPU) y sólo depende del audio, no de cómo se transcriba. Guardarla
+# junto al audio permite reprocesar el mismo fichero -otro modelo, otro
+# formato de salida, otro post-proceso- sin volver a pagarla.
+# --------------------------------------------------------------------------
+
+def ruta_cache_turnos(ruta_audio):
+    base = os.path.splitext(os.path.abspath(ruta_audio))[0]
+    return base + "_hablantes.json"
+
+
+def guardar_turnos(ruta_cache, turnos, duracion_audio):
+    import json
+
+    datos = {
+        "version": 1,
+        "modelo": os.environ.get("PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1"),
+        "duracion_audio": round(duracion_audio, 2),
+        "turnos": [[round(a, 3), round(b, 3), e] for a, b, e in turnos],
+    }
+    try:
+        with open(ruta_cache, "w", encoding="utf-8") as f:
+            json.dump(datos, f, ensure_ascii=False)
+    except OSError as e:
+        print(f"[!] No se pudo guardar la cache de hablantes: {e}")
+
+
+def cargar_turnos(ruta_cache, duracion_audio):
+    """Devuelve los turnos guardados si son de este audio; si no, None."""
+    import json
+
+    if not os.path.isfile(ruta_cache):
+        return None
+    try:
+        with open(ruta_cache, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+        # La duración es la comprobación barata de que la caché es de este audio
+        if abs(datos.get("duracion_audio", -1) - duracion_audio) > 1.0:
+            print("[!] La cache de hablantes no corresponde a este audio; se rehace.")
+            return None
+        return [(float(a), float(b), str(e)) for a, b, e in datos["turnos"]]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"[!] Cache de hablantes ilegible ({e}); se rehace.")
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -290,6 +340,34 @@ class Turnos:
             if distancia < distancia_min:
                 distancia_min, mejor = distancia, etq
         return mejor
+
+    def confianza(self, inicio, fin, etiqueta):
+        """
+        Cuánto respalda pyannote que ese tramo sea de ese hablante, de -1 a 1.
+
+            1.0  el tramo cae entero dentro de turnos suyos
+            0.0  mitad y mitad, o nadie: se asignó por cercanía, a ojo
+           -1.0  el tramo es en realidad de otro (lo puso ahí el post-proceso)
+
+        Se normaliza por el tiempo REALMENTE cubierto por turnos, no por la
+        duración de la línea: si no, los silencios y las pausas penalizarían a
+        atribuciones que son perfectas. Las voces solapadas sí penalizan, y es
+        lo suyo: hablando dos a la vez, cualquier atribución es dudosa.
+        """
+        desde, hasta = self._ventana(inicio, fin)
+        asignado = otros = 0.0
+        for t_ini, t_fin, etq in self.turnos[desde:hasta]:
+            solape = min(fin, t_fin) - max(inicio, t_ini)
+            if solape <= 0:
+                continue
+            if etq == etiqueta:
+                asignado += solape
+            else:
+                otros += solape
+        cubierto = asignado + otros
+        if cubierto <= 0:
+            return 0.0
+        return (asignado - otros) / cubierto
 
 
 # Un cambio de hablante sólo se cree si trae texto suficiente detrás. Por
@@ -516,6 +594,22 @@ def _lineas_sin_hablante(segmentos):
     return salida
 
 
+# Por debajo de este respaldo (ver Turnos.confianza) la línea se marca con (?).
+# 0.6 deja pasar las atribuciones limpias con algún roce y señala las que se
+# reparten entre dos hablantes o se han asignado a ojo.
+UMBRAL_DUDA = float(os.environ.get("TRANSCRIBIR_UMBRAL_DUDA", "0.6"))
+
+
+def _reparto_tiempo(lineas, mapa):
+    """'Ana 48% · Luis 35% · Pedro 17%', para ver de un vistazo si es creíble."""
+    tiempos = {}
+    for ini, fin, etiqueta, _ in lineas:
+        tiempos[etiqueta] = tiempos.get(etiqueta, 0.0) + (fin - ini)
+    total = sum(tiempos.values()) or 1.0
+    partes = sorted(tiempos.items(), key=lambda kv: -kv[1])
+    return " · ".join(f"{mapa.get(e, '?')} {100 * t / total:.0f}%" for e, t in partes)
+
+
 def agrupar_lineas(lineas, hueco_max=2.0, duracion_max=60.0):
     """
     Une líneas consecutivas del mismo hablante en párrafos.
@@ -608,6 +702,7 @@ def transcribir_archivo(
     procesos=None,
     idioma=None,
     agrupar=True,
+    rehacer_hablantes=False,
     preguntar_segmento=None,  # compatibilidad con la firma antigua
 ):
     """
@@ -644,14 +739,25 @@ def transcribir_archivo(
         trozos = calcular_trozos(muestras, 16000) if procesos > 1 else [(0.0, duracion_total)]
         del muestras
 
+        # ¿Ya sabemos quién habla en este audio de una vez anterior?
+        turnos, aviso_diarizacion, segmentos, idiomas = [], None, [], []
+        ruta_cache = ruta_cache_turnos(ruta_archivo_audio)
+        if diarizar_audio and not rehacer_hablantes:
+            turnos = cargar_turnos(ruta_cache, duracion_total) or []
+            if turnos:
+                voces = len({t[2] for t in turnos})
+                print(f"Hablantes reutilizados de {os.path.basename(ruta_cache)}"
+                      f" ({voces} voces): nos ahorramos la diarización.")
+        hay_que_diarizar = bool(diarizar_audio and not turnos)
+
         en_paralelo, hilos, hilos_diarizacion = _plan_de_trabajo(
-            procesos, diarizar_audio, len(trozos))
+            procesos, hay_que_diarizar, len(trozos))
         print("Archivo cargado:")
         print(f"  - Duración total: {duracion_total / 60:.1f} minutos ({duracion_total:.0f} segundos)")
         print(f"  - Modo '{modo}': {perfil['descripcion']}")
         print(f"  - Modelo {modelo_whisper or MODELO_WHISPER}, {len(trozos)} trozo(s),"
               f" {en_paralelo} proceso(s) x {hilos} hilos"
-              + (f" (+{hilos_diarizacion} hilos para los hablantes)" if diarizar_audio else ""))
+              + (f" (+{hilos_diarizacion} hilos para los hablantes)" if hay_que_diarizar else ""))
 
         nombre_base = os.path.splitext(nombre_archivo)[0]
         nombre_archivo_transcripcion = nombre_base + "_transcripcion.txt"
@@ -666,18 +772,16 @@ def transcribir_archivo(
             "contexto": perfil["contexto"],
         }
 
-        turnos, aviso_diarizacion, segmentos, idiomas = [], None, [], []
-
-        if en_paralelo > 1 or diarizar_audio:
+        if en_paralelo > 1 or hay_que_diarizar:
             # La diarización y la transcripción son independientes: se lanzan a
             # la vez y cada una se queda con su parte de los núcleos. En serie,
             # una hora de audio costaba la suma de las dos.
             from concurrent.futures import ProcessPoolExecutor
 
-            trabajadores = en_paralelo + (1 if diarizar_audio else 0)
+            trabajadores = en_paralelo + (1 if hay_que_diarizar else 0)
             with ProcessPoolExecutor(max_workers=trabajadores) as ejecutor:
                 futuro_diarizacion = None
-                if diarizar_audio:
+                if hay_que_diarizar:
                     print("\nIdentificando hablantes en paralelo (pyannote)...")
                     futuro_diarizacion = ejecutor.submit(_worker_diarizar, {
                         "ruta": tmp_path,
@@ -685,6 +789,8 @@ def transcribir_archivo(
                         "min_hablantes": min_hablantes,
                         "max_hablantes": max_hablantes,
                         "hilos": hilos_diarizacion,
+                        "cache": ruta_cache,
+                        "duracion_audio": duracion_total,
                     })
 
                 print("\nIniciando transcripción con Whisper...")
@@ -733,19 +839,29 @@ def transcribir_archivo(
                 lineas = agrupar_lineas(lineas, hueco_max=1.0, duracion_max=30.0)
         mapa = _mapa_nombres(lineas, nombres) if indice else {}
 
+        # Cada línea con su nivel de respaldo, para no dar por buenas todas
+        confianzas = [indice.confianza(l[0], l[1], l[2]) if indice else 1.0 for l in lineas]
+        dudosas = sum(1 for c in confianzas if c < UMBRAL_DUDA)
+
         idioma_detectado = max(set(idiomas), key=idiomas.count) if idiomas else "desconocido"
         with open(ruta_archivo_transcripcion, "w", encoding="utf-8") as f:
             f.write(f"[Idioma principal detectado: {idioma_detectado}]\n")
             if mapa:
                 f.write(f"[Hablantes identificados: {len(mapa)} - {', '.join(mapa.values())}]\n")
+                f.write(f"[Reparto del tiempo: {_reparto_tiempo(lineas, mapa)}]\n")
+                if dudosas:
+                    f.write(f"[Atribuciones dudosas: {dudosas} de {len(lineas)} lineas"
+                            f" ({100 * dudosas / len(lineas):.0f}%), marcadas con (?)."
+                            " No te fies del hablante en esas lineas]\n")
             elif aviso_diarizacion:
                 f.write(f"[Sin identificacion de hablantes: {aviso_diarizacion.splitlines()[0]}]\n")
             f.write("\n")
 
-            for ini, fin, etiqueta, texto in lineas:
+            for (ini, fin, etiqueta, texto), confianza in zip(lineas, confianzas):
                 marca = f"[{_formato_tiempo(ini)} -> {_formato_tiempo(fin)}]"
                 if mapa:
-                    f.write(f"{marca} {mapa.get(etiqueta, '?')}: {texto}\n")
+                    duda = " (?)" if confianza < UMBRAL_DUDA else ""
+                    f.write(f"{marca} {mapa.get(etiqueta, '?')}{duda}: {texto}\n")
                 else:
                     f.write(f"{marca} {texto}\n")
 
@@ -812,6 +928,8 @@ def _parsear_argumentos(argv=None):
                    help="Fuerza el idioma (es, en...) en vez de detectarlo por trozo.")
     p.add_argument("--sin-agrupar", action="store_true",
                    help="Una línea por frase, sin unir las del mismo hablante.")
+    p.add_argument("--rehacer-hablantes", action="store_true",
+                   help="Ignora los turnos guardados de una ejecución anterior y los recalcula.")
     return p.parse_args(argv)
 
 
@@ -862,6 +980,7 @@ def main(argv=None):
             procesos=args.procesos,
             idioma=args.idioma,
             agrupar=not args.sin_agrupar,
+            rehacer_hablantes=args.rehacer_hablantes,
         ):
             exitosos += 1
 
