@@ -1,0 +1,46 @@
+services:
+  vigilante:
+    build:
+      context: ..
+      dockerfile: vigilante/Dockerfile
+    image: transcriptor-vigilante:latest
+    container_name: transcriptor-vigilante
+    restart: unless-stopped
+    env_file: .env
+
+    environment:
+      # Hablamos con Nextcloud por dentro de la red de Umbrel, saltándonos el
+      # app_proxy: ese proxy mete la autenticación de Umbrel y rompería el
+      # WebDAV. "nextcloud_web_1" ya figura en los trusted_domains.
+      NC_URL: http://nextcloud_web_1
+      # Dos hilos por trabajador: el contenedor ve los 4 núcleos del N100
+      # (aunque cpus lo tope a 3), así que salen 2 trabajadores x 2 hilos.
+      # Primer mando a tocar al medir.
+      TRANSCRIBIR_HILOS: "2"
+
+    volumes:
+      # Modelo de Whisper: se baja una vez y se queda.
+      - modelos:/modelos
+
+    # El N100 tiene 4 núcleos y comparte casa con Immich, Jellyfin, Vaultwarden
+    # y el propio Nextcloud. Sin tope, Whisper se lleva los cuatro y
+    # el Umbrel deja de responder mientras dura la transcripción.
+    cpus: "3.0"
+    cpu_shares: 512
+    mem_limit: 6g
+
+    networks:
+      - umbrel_main_network
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  modelos:
+
+networks:
+  umbrel_main_network:
+    external: true

@@ -1,6 +1,3 @@
-openai-whisper
-pydub==0.25.1
-torch
-torchaudio
-# Diarización de hablantes (quién dice cada cosa)
-pyannote.audio
+# Whisper sobre CTranslate2: mismo modelo que openai-whisper, varias veces más
+# rápido en CPU y sin torch. Decodifica el audio con PyAV (sin ffmpeg aparte).
+faster-whisper

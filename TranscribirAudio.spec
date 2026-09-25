@@ -1,34 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
-
-block_cipher = None
-
-datas = []
-datas += collect_data_files("whisper")
-datas += collect_data_files("tiktoken")
-datas += collect_data_files("tiktoken_ext")
-datas += [("assets/whisper_models/small.pt", "whisper_models")]
-datas += [("assets/ffmpeg/ffmpeg.exe", "ffmpeg")]
-
-hiddenimports = []
-hiddenimports += collect_submodules("tiktoken_ext")
+# La aplicación de ventana (app.py), sin consola. El modelo de Whisper NO va
+# dentro: se descarga a modelos/, junto al .exe. ctranslate2, onnxruntime y av
+# traen sus propios hooks.
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 a = Analysis(
-    ["transcribe_audio.py"],
-    pathex=[],
-    binaries=[],
-    datas=datas,
-    hiddenimports=hiddenimports,
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
-    noarchive=False,
+    ["app.py"],
+    binaries=collect_dynamic_libs("ctranslate2"),
+    datas=collect_data_files("faster_whisper")  # modelo del VAD (silero, .onnx)
+    + [("assets/icono.ico", ".")],               # icono de la ventana
+    excludes=["torch", "matplotlib", "IPython", "pytest"],
 )
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz,
@@ -40,18 +23,18 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon="assets/icono.ico",  # icono del .exe (se regenera con assets/hacer_icono.py)
 )
 
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,
     strip=False,
     upx=False,

@@ -14,7 +14,6 @@
 *.wma
 *.aac
 *_transcripcion.txt
-*_hablantes.json
 
 # Claude Code
 .claude/
@@ -24,13 +23,22 @@ build/
 dist/
 *.spec.bak
 
-# Assets pesados que no se trackean (se reponen con scripts o manualmente)
-assets/ffmpeg/*.exe
-assets/whisper_models/*.pt
+# Modelos de Whisper descargados (se bajan solos la primera vez)
+modelos/
 
-# Token de Hugging Face (NO subir)
-.hf_token
+# Configuración local de quien desarrolla (la app la cambia al usarla). La de
+# fábrica la genera build.ps1 desde la plantilla de gestor_modelos.py
+TranscribirAudio.ini
+
+# Vista previa del icono (se regenera con assets/hacer_icono.py)
+assets/icono_muestra.png
+
+# Entorno viejo (openai-whisper + pyannote), pendiente de borrar
+.venv.old/
 
 # Cache de Python
 __pycache__/
 *.pyc
+
+# Vigilante: secretos de Nextcloud
+vigilante/.env
